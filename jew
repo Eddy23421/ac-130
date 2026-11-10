@@ -1,0 +1,1138 @@
+--[[
+    Survive an AC-130 - Tactical Suite 4.0 (Auto-Dodge & Auto-Extract Edition)
+    Features:
+    - Auto-Dodge Bullets: Automatically maneuvers character away from predicted shell impacts & crosshair blast zones
+    - Auto-Extract: Continuously navigates character to Extraction LZ & helicopter when extraction opens
+    - Ultra-Accurate Ballistics Engine: High-resolution raycasts with CanQuery=false on all markers
+    - Real-Time Flying Shell Tracers: Physical luminous projectile beads following server trajectory
+    - Holographic Reticles & LZ Marker: Sleek geometric landing zone & blast indicators (No messy text clutter)
+    - FLIR Thermal Detection: Real-time sensor indicator for Gunner #1 and Gunner #2
+    - Tactical Dual-Cover Radar: Dual raycast blindspot detection with cardinal direction compass (N/S/E/W)
+    - Survivor ESP & Sky ESP
+    - Military Glassmorphic HUD with individual toggles & Single-Click Unload
+--]]
+
+if _G.AC130TrackerUnload then
+    pcall(_G.AC130TrackerUnload)
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+local GameState = ReplicatedStorage:WaitForChild("GameState", 5)
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
+
+if not GameState or not Remotes then
+    warn("[AC-130 Tactical] Critical dependencies missing!")
+    return
+end
+
+local Ballistics = nil
+pcall(function()
+    Ballistics = require(ReplicatedStorage.Shared.Ballistics)
+end)
+
+local WEAPONS = {
+    [1] = { name = "25mm GAU-12", code = "25mm", radius = 5, color = Color3.fromRGB(255, 210, 110) },
+    [2] = { name = "40mm Bofors", code = "40mm", radius = 13, color = Color3.fromRGB(255, 145, 50) },
+    [3] = { name = "105mm M102", code = "105mm", radius = 32, color = Color3.fromRGB(255, 60, 60) },
+    [4] = { name = "JUDGEMENT 300mm", code = "300mm", radius = 70, color = Color3.fromRGB(255, 20, 20) },
+}
+
+local settings = {
+    autoDodge = true,
+    autoExtract = true,
+    showAimRings = true,
+    showTracerBeams = true,
+    showCoverWaypoint = true,
+    showESP = true,
+    showBallistics = true,
+}
+
+local connections = {}
+local cleanupObjects = {}
+local espRegistry = {}
+local activeProjectiles = {}
+
+-- ROOT UI CONTAINER
+local uiParent = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or LocalPlayer:WaitForChild("PlayerGui")
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AC130TacticalSuite4"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = uiParent
+table.insert(cleanupObjects, screenGui)
+
+-- 3D WORLD VISUAL CONTAINER
+local visualFolder = Instance.new("Folder")
+visualFolder.Name = "AC130TacticalVisuals4"
+visualFolder.Parent = workspace
+table.insert(cleanupObjects, visualFolder)
+
+local function sanitizePart(part)
+    part.CanCollide = false
+    part.CanTouch = false
+    part.CanQuery = false
+    part.CastShadow = false
+    part.Anchored = true
+    return part
+end
+
+-- 1. HOLOGRAPHIC AIM RETICLE GENERATOR
+local function createAimReticle(id, colorTheme)
+    local reticleModel = Instance.new("Model")
+    reticleModel.Name = "AimReticle_" .. id
+    reticleModel.Parent = visualFolder
+
+    local bead = sanitizePart(Instance.new("Part"))
+    bead.Shape = Enum.PartType.Ball
+    bead.Size = Vector3.new(2, 2, 2)
+    bead.Material = Enum.Material.Neon
+    bead.Color = colorTheme
+    bead.Transparency = 0.2
+    bead.Parent = reticleModel
+
+    local outerRing = sanitizePart(Instance.new("Part"))
+    outerRing.Shape = Enum.PartType.Cylinder
+    outerRing.Size = Vector3.new(0.35, 20, 20)
+    outerRing.Orientation = Vector3.new(0, 0, 90)
+    outerRing.Material = Enum.Material.ForceField
+    outerRing.Color = colorTheme
+    outerRing.Transparency = 0.35
+    outerRing.Parent = reticleModel
+
+    local box = Instance.new("SelectionBox")
+    box.Adornee = outerRing
+    box.Color3 = colorTheme
+    box.SurfaceTransparency = 0.95
+    box.LineThickness = 0.05
+    box.Parent = outerRing
+
+    local attPlane = Instance.new("Attachment")
+    attPlane.Parent = visualFolder
+
+    local attTarget = Instance.new("Attachment")
+    attTarget.Parent = bead
+
+    local beam = Instance.new("Beam")
+    beam.Attachment0 = attPlane
+    beam.Attachment1 = attTarget
+    beam.Color = ColorSequence.new(colorTheme)
+    beam.Width0 = 0.35
+    beam.Width1 = 0.75
+    beam.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.45),
+        NumberSequenceKeypoint.new(1, 0.1)
+    })
+    beam.LightEmission = 1
+    beam.LightInfluence = 0
+    beam.FaceCamera = true
+    beam.Parent = reticleModel
+
+    return {
+        model = reticleModel,
+        bead = bead,
+        outerRing = outerRing,
+        box = box,
+        attPlane = attPlane,
+        attTarget = attTarget,
+        beam = beam
+    }
+end
+
+local reticle1 = createAimReticle(1, Color3.fromRGB(255, 65, 65))
+local reticle2 = createAimReticle(2, Color3.fromRGB(255, 165, 45))
+
+-- 2. BLINDSPOT & COVER WAYPOINT
+local coverPillar = sanitizePart(Instance.new("Part"))
+coverPillar.Name = "CoverPillar"
+coverPillar.Shape = Enum.PartType.Cylinder
+coverPillar.Size = Vector3.new(0.4, 7, 7)
+coverPillar.Orientation = Vector3.new(0, 0, 90)
+coverPillar.Material = Enum.Material.ForceField
+coverPillar.Color = Color3.fromRGB(50, 255, 130)
+coverPillar.Transparency = 0.3
+coverPillar.Parent = visualFolder
+
+local coverBox = Instance.new("SelectionBox")
+coverBox.Adornee = coverPillar
+coverBox.Color3 = Color3.fromRGB(80, 255, 160)
+coverBox.LineThickness = 0.04
+coverBox.Parent = coverPillar
+
+-- 3. EXTRACTION ZONE RETICLE
+local extractReticle = sanitizePart(Instance.new("Part"))
+extractReticle.Name = "ExtractionReticle"
+extractReticle.Shape = Enum.PartType.Cylinder
+extractReticle.Size = Vector3.new(0.5, 14, 14) -- 7 stud radius zone
+extractReticle.Orientation = Vector3.new(0, 0, 90)
+extractReticle.Material = Enum.Material.ForceField
+extractReticle.Color = Color3.fromRGB(0, 255, 200)
+extractReticle.Transparency = 0.25
+extractReticle.Parent = visualFolder
+
+local extractBox = Instance.new("SelectionBox")
+extractBox.Adornee = extractReticle
+extractBox.Color3 = Color3.fromRGB(0, 255, 230)
+extractBox.LineThickness = 0.06
+extractBox.Parent = extractReticle
+
+-- 4. MODERN MILITARY GLASSMORPHIC HUD
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "TacticalHUD"
+mainFrame.Size = UDim2.new(0, 320, 0, 520)
+mainFrame.Position = UDim2.new(0, 25, 0.5, -260)
+mainFrame.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
+mainFrame.BackgroundTransparency = 0.05
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.ClipsDescendants = true
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 10)
+mainCorner.Parent = mainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(45, 55, 75)
+mainStroke.Thickness = 1.5
+mainStroke.Parent = mainFrame
+
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 42)
+header.BackgroundColor3 = Color3.fromRGB(18, 22, 32)
+header.BorderSizePixel = 0
+header.Parent = mainFrame
+
+local headerAccent = Instance.new("Frame")
+headerAccent.Size = UDim2.new(1, 0, 0, 2)
+headerAccent.BackgroundColor3 = Color3.fromRGB(0, 190, 255)
+headerAccent.BorderSizePixel = 0
+headerAccent.Parent = header
+
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(1, -95, 1, 0)
+titleText.Position = UDim2.new(0, 12, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Font = Enum.Font.GothamBold
+titleText.TextSize = 13
+titleText.TextColor3 = Color3.fromRGB(240, 245, 255)
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.Text = "TACTICAL RADAR 4.0"
+titleText.Parent = header
+
+local modeBadge = Instance.new("TextLabel")
+modeBadge.Size = UDim2.new(0, 80, 0, 20)
+modeBadge.Position = UDim2.new(1, -90, 0.5, -10)
+modeBadge.BackgroundColor3 = Color3.fromRGB(25, 45, 65)
+modeBadge.Font = Enum.Font.GothamBold
+modeBadge.TextSize = 10
+modeBadge.TextColor3 = Color3.fromRGB(100, 200, 255)
+modeBadge.Text = "STANDARD"
+modeBadge.Parent = header
+
+local badgeCorner = Instance.new("UICorner")
+badgeCorner.CornerRadius = UDim.new(0, 4)
+badgeCorner.Parent = modeBadge
+
+-- Dragging
+local dragging, dragInput, dragStart, startPos
+local function updateDrag(input)
+    local delta = input.Position - dragStart
+    mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+header.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+local dragConn = UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        updateDrag(input)
+    end
+end)
+table.insert(connections, dragConn)
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -20, 1, -52)
+content.Position = UDim2.new(0, 10, 0, 48)
+content.BackgroundTransparency = 1
+content.Parent = mainFrame
+
+local contentLayout = Instance.new("UIListLayout")
+contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+contentLayout.Padding = UDim.new(0, 5)
+contentLayout.Parent = content
+
+local function createGunnerCard(id, accentColor, order)
+    local card = Instance.new("Frame")
+    card.Name = "GunnerCard" .. id
+    card.Size = UDim2.new(1, 0, 0, 68)
+    card.BackgroundColor3 = Color3.fromRGB(17, 20, 28)
+    card.BorderSizePixel = 0
+    card.LayoutOrder = order
+    card.Parent = content
+
+    local cardCorner = Instance.new("UICorner")
+    cardCorner.CornerRadius = UDim.new(0, 6)
+    cardCorner.Parent = card
+
+    local cardStroke = Instance.new("UIStroke")
+    cardStroke.Color = Color3.fromRGB(35, 42, 58)
+    cardStroke.Thickness = 1
+    cardStroke.Parent = card
+
+    local leftAccent = Instance.new("Frame")
+    leftAccent.Size = UDim2.new(0, 3, 1, 0)
+    leftAccent.BackgroundColor3 = accentColor
+    leftAccent.BorderSizePixel = 0
+    leftAccent.Parent = card
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(0.6, 0, 0, 20)
+    titleLbl.Position = UDim2.new(0, 10, 0, 4)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Font = Enum.Font.GothamBold
+    titleLbl.TextSize = 11
+    titleLbl.TextColor3 = Color3.fromRGB(240, 245, 255)
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Text = "GUNNER #" .. id .. ": STANDBY"
+    titleLbl.Parent = card
+
+    local thermalBadge = Instance.new("TextLabel")
+    thermalBadge.Size = UDim2.new(0, 85, 0, 18)
+    thermalBadge.Position = UDim2.new(1, -95, 0, 5)
+    thermalBadge.BackgroundColor3 = Color3.fromRGB(25, 30, 40)
+    thermalBadge.Font = Enum.Font.GothamBold
+    thermalBadge.TextSize = 9
+    thermalBadge.TextColor3 = Color3.fromRGB(160, 170, 185)
+    thermalBadge.Text = "FLIR: OFF"
+    thermalBadge.Parent = card
+
+    local tbCorner = Instance.new("UICorner")
+    tbCorner.CornerRadius = UDim.new(0, 4)
+    tbCorner.Parent = thermalBadge
+
+    local wpnLbl = Instance.new("TextLabel")
+    wpnLbl.Size = UDim2.new(1, -20, 0, 18)
+    wpnLbl.Position = UDim2.new(0, 10, 0, 24)
+    wpnLbl.BackgroundTransparency = 1
+    wpnLbl.Font = Enum.Font.GothamMedium
+    wpnLbl.TextSize = 11
+    wpnLbl.TextColor3 = Color3.fromRGB(150, 160, 180)
+    wpnLbl.TextXAlignment = Enum.TextXAlignment.Left
+    wpnLbl.Text = "Weapon: Detecting..."
+    wpnLbl.Parent = card
+
+    local distBar = Instance.new("TextLabel")
+    distBar.Size = UDim2.new(1, -20, 0, 18)
+    distBar.Position = UDim2.new(0, 10, 0, 44)
+    distBar.BackgroundTransparency = 1
+    distBar.Font = Enum.Font.GothamBold
+    distBar.TextSize = 11
+    distBar.TextColor3 = Color3.fromRGB(100, 220, 140)
+    distBar.TextXAlignment = Enum.TextXAlignment.Left
+    distBar.Text = "Crosshair Distance: 0 studs"
+    distBar.Parent = card
+
+    return {
+        card = card,
+        titleLbl = titleLbl,
+        thermalBadge = thermalBadge,
+        wpnLbl = wpnLbl,
+        distBar = distBar
+    }
+end
+
+local gCard1 = createGunnerCard(1, Color3.fromRGB(255, 65, 65), 1)
+local gCard2 = createGunnerCard(2, Color3.fromRGB(255, 165, 45), 2)
+
+-- Tactical Status Box
+local telemetryBox = Instance.new("Frame")
+telemetryBox.Name = "TelemetryBox"
+telemetryBox.Size = UDim2.new(1, 0, 0, 72)
+telemetryBox.BackgroundColor3 = Color3.fromRGB(17, 20, 28)
+telemetryBox.BorderSizePixel = 0
+telemetryBox.LayoutOrder = 3
+telemetryBox.Parent = content
+
+local tCorner = Instance.new("UICorner")
+tCorner.CornerRadius = UDim.new(0, 6)
+tCorner.Parent = telemetryBox
+
+local coverStatusLabel = Instance.new("TextLabel")
+coverStatusLabel.Size = UDim2.new(1, -20, 0, 22)
+coverStatusLabel.Position = UDim2.new(0, 10, 0, 5)
+coverStatusLabel.BackgroundTransparency = 1
+coverStatusLabel.Font = Enum.Font.GothamBold
+coverStatusLabel.TextSize = 12
+coverStatusLabel.TextColor3 = Color3.fromRGB(80, 255, 140)
+coverStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+coverStatusLabel.Text = "COVER: SCANNING ENVIRONMENT"
+coverStatusLabel.Parent = telemetryBox
+
+local navGuideLabel = Instance.new("TextLabel")
+navGuideLabel.Size = UDim2.new(1, -20, 0, 18)
+navGuideLabel.Position = UDim2.new(0, 10, 0, 26)
+navGuideLabel.BackgroundTransparency = 1
+navGuideLabel.Font = Enum.Font.GothamMedium
+navGuideLabel.TextSize = 11
+navGuideLabel.TextColor3 = Color3.fromRGB(180, 190, 205)
+navGuideLabel.TextXAlignment = Enum.TextXAlignment.Left
+navGuideLabel.Text = "Blindspot Guide: Calculating..."
+navGuideLabel.Parent = telemetryBox
+
+local extractStatusLabel = Instance.new("TextLabel")
+extractStatusLabel.Size = UDim2.new(1, -20, 0, 18)
+extractStatusLabel.Position = UDim2.new(0, 10, 0, 46)
+extractStatusLabel.BackgroundTransparency = 1
+extractStatusLabel.Font = Enum.Font.GothamBold
+extractStatusLabel.TextSize = 11
+extractStatusLabel.TextColor3 = Color3.fromRGB(0, 220, 255)
+extractStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+extractStatusLabel.Text = "EXTRACTION: AWAITING LZ"
+extractStatusLabel.Parent = telemetryBox
+
+-- Feature Toggles
+local function createToggle(text, defaultState, onClick, order, activeColor)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 22)
+    btn.BackgroundColor3 = defaultState and (activeColor or Color3.fromRGB(24, 48, 40)) or Color3.fromRGB(22, 26, 35)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.TextColor3 = defaultState and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 185)
+    btn.Text = (defaultState and "✓ " or "✗ ") .. text
+    btn.LayoutOrder = order
+    btn.Parent = content
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = defaultState and Color3.fromRGB(40, 95, 75) or Color3.fromRGB(35, 42, 58)
+    stroke.Thickness = 1
+    stroke.Parent = btn
+
+    local active = defaultState
+    btn.MouseButton1Click:Connect(function()
+        active = not active
+        btn.BackgroundColor3 = active and (activeColor or Color3.fromRGB(24, 48, 40)) or Color3.fromRGB(22, 26, 35)
+        btn.TextColor3 = active and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 185)
+        stroke.Color = active and Color3.fromRGB(40, 95, 75) or Color3.fromRGB(35, 42, 58)
+        btn.Text = (active and "✓ " or "✗ ") .. text
+        onClick(active)
+    end)
+    return btn
+end
+
+-- NEW FEATURES: Auto-Dodge and Auto-Extract
+createToggle("Auto-Dodge Bullets & Blast Zones", settings.autoDodge, function(v)
+    settings.autoDodge = v
+end, 4, Color3.fromRGB(80, 40, 90))
+
+createToggle("Auto-Extract at LZ Helicopter", settings.autoExtract, function(v)
+    settings.autoExtract = v
+end, 5, Color3.fromRGB(20, 60, 70))
+
+createToggle("High-Precision Ballistic Reticles", settings.showBallistics, function(v)
+    settings.showBallistics = v
+end, 6)
+
+createToggle("Survivor ESP & Health", settings.showESP, function(v)
+    settings.showESP = v
+    for _, item in pairs(espRegistry) do
+        if item.highlight then item.highlight.Enabled = v end
+        if item.billboard then item.billboard.Enabled = v end
+    end
+end, 7)
+
+createToggle("Blindspot & Cover Finder", settings.showCoverWaypoint, function(v)
+    settings.showCoverWaypoint = v
+    coverPillar.Transparency = v and 0.3 or 1
+    coverBox.Visible = v
+end, 8)
+
+createToggle("Gunship Aim Reticles & Lasers", settings.showAimRings, function(v)
+    settings.showAimRings = v
+    reticle1.bead.Transparency = v and 0.2 or 1
+    reticle1.outerRing.Transparency = v and 0.35 or 1
+    reticle1.beam.Enabled = v
+    reticle2.bead.Transparency = v and 0.2 or 1
+    reticle2.outerRing.Transparency = v and 0.35 or 1
+    reticle2.beam.Enabled = v
+end, 9)
+
+-- Close / Unload Button
+local closeBtn = Instance.new("TextButton")
+closeBtn.Name = "UnloadButton"
+closeBtn.Size = UDim2.new(1, 0, 0, 26)
+closeBtn.BackgroundColor3 = Color3.fromRGB(180, 45, 45)
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 11
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Text = "🛑 CLOSE & UNLOAD TACTICAL SUITE"
+closeBtn.LayoutOrder = 10
+closeBtn.Parent = content
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 5)
+closeCorner.Parent = closeBtn
+
+local function unloadScript()
+    print("[AC-130 Tactical] Completely unloading script...")
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(connections)
+
+    for _, obj in ipairs(cleanupObjects) do
+        pcall(function() obj:Destroy() end)
+    end
+    table.clear(cleanupObjects)
+
+    for p, item in pairs(espRegistry) do
+        if item.highlight then pcall(function() item.highlight:Destroy() end) end
+        if item.billboard then pcall(function() item.billboard:Destroy() end) end
+    end
+    table.clear(espRegistry)
+
+    for _, p in pairs(activeProjectiles) do
+        if p.model then pcall(function() p.model:Destroy() end) end
+    end
+    table.clear(activeProjectiles)
+
+    _G.AC130TrackerUnload = nil
+    print("[AC-130 Tactical] Clean unload complete.")
+end
+
+_G.AC130TrackerUnload = unloadScript
+closeBtn.MouseButton1Click:Connect(unloadScript)
+
+-- 5. ACCURATE BALLISTICS ENGINE
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.FilterDescendantsInstances = {
+    workspace:FindFirstChild("GunshipVisual"),
+    workspace:FindFirstChild("GunshipVisual2"),
+    workspace.CurrentCamera,
+    visualFolder
+}
+
+local function solveBallisticImpact(origin, vel)
+    local gravity = Vector3.new(0, -35, 0)
+    local prev = origin
+    local impactPoint = nil
+    local flightTime = 2
+
+    for step = 1, 300 do
+        local t = step * 0.01
+        local curr = origin + vel * t + 0.5 * gravity * t * t
+        local hit = workspace:Raycast(prev, curr - prev, rayParams)
+        if hit then
+            impactPoint = hit.Position
+            flightTime = t
+            break
+        end
+        prev = curr
+    end
+
+    if not impactPoint then
+        impactPoint = prev
+    end
+    return impactPoint, flightTime
+end
+
+local activeTracerPool = 0
+local maxTracers = 18
+
+local function onProjectileFired(projId, weaponId, origin, vel, t0)
+    local wpn = WEAPONS[weaponId] or { name = "Shell", radius = 10, color = Color3.fromRGB(255, 120, 60) }
+    local impactPos, flightTime = solveBallisticImpact(origin, vel)
+
+    if settings.showBallistics and not (activeTracerPool >= maxTracers and weaponId == 1) then
+        activeTracerPool = activeTracerPool + 1
+        local pModel = Instance.new("Model")
+        pModel.Name = "Proj_" .. tostring(projId)
+        pModel.Parent = visualFolder
+
+        local bulletBead = sanitizePart(Instance.new("Part"))
+        bulletBead.Shape = Enum.PartType.Ball
+        bulletBead.Size = Vector3.new(1.8, 1.8, 1.8)
+        bulletBead.CFrame = CFrame.new(origin)
+        bulletBead.Material = Enum.Material.Neon
+        bulletBead.Color = wpn.color
+        bulletBead.Parent = pModel
+
+        local a0 = Instance.new("Attachment")
+        a0.Position = Vector3.new(0, 0.4, 0)
+        a0.Parent = bulletBead
+
+        local a1 = Instance.new("Attachment")
+        a1.Position = Vector3.new(0, -0.4, 0)
+        a1.Parent = bulletBead
+
+        local trail = Instance.new("Trail")
+        trail.Attachment0 = a0
+        trail.Attachment1 = a1
+        trail.Color = ColorSequence.new(wpn.color)
+        trail.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.1),
+            NumberSequenceKeypoint.new(1, 1)
+        })
+        trail.Lifetime = 0.35
+        trail.LightEmission = 1
+        trail.FaceCamera = true
+        trail.Parent = bulletBead
+
+        local landRing = sanitizePart(Instance.new("Part"))
+        landRing.Shape = Enum.PartType.Cylinder
+        landRing.Size = Vector3.new(0.3, wpn.radius * 2, wpn.radius * 2)
+        landRing.CFrame = CFrame.new(impactPos) * CFrame.Angles(0, 0, math.rad(90))
+        landRing.Material = Enum.Material.ForceField
+        landRing.Color = wpn.color
+        landRing.Transparency = 0.25
+        landRing.Parent = pModel
+
+        local ringBox = Instance.new("SelectionBox")
+        ringBox.Adornee = landRing
+        ringBox.Color3 = wpn.color
+        ringBox.LineThickness = 0.05
+        ringBox.Parent = landRing
+
+        local projRecord = {
+            model = pModel,
+            bulletBead = bulletBead,
+            landRing = landRing,
+            origin = origin,
+            vel = vel,
+            t0 = t0 or workspace:GetServerTimeNow(),
+            impactPos = impactPos,
+            flightTime = flightTime,
+            color = wpn.color,
+            radius = wpn.radius
+        }
+        activeProjectiles[projId] = projRecord
+
+        local duration = math.clamp(flightTime + 0.3, 0.4, 4.0)
+        task.delay(duration, function()
+            if activeProjectiles[projId] == projRecord then
+                activeProjectiles[projId] = nil
+                activeTracerPool = math.max(0, activeTracerPool - 1)
+                pModel:Destroy()
+            end
+        end)
+    else
+        -- Track impact for auto-dodge even if tracers are capped
+        activeProjectiles[projId] = {
+            origin = origin,
+            vel = vel,
+            t0 = t0 or workspace:GetServerTimeNow(),
+            impactPos = impactPos,
+            flightTime = flightTime,
+            radius = wpn.radius
+        }
+        task.delay(flightTime + 0.3, function()
+            if activeProjectiles[projId] then
+                activeProjectiles[projId] = nil
+            end
+        end)
+    end
+end
+
+local projConn = Remotes.Projectile.OnClientEvent:Connect(function(projId, weaponId, origin, vel, t0)
+    pcall(onProjectileFired, projId, weaponId, origin, vel, t0)
+end)
+table.insert(connections, projConn)
+
+local impactConn = Remotes.Impact.OnClientEvent:Connect(function(projId)
+    local p = activeProjectiles[projId]
+    if p then
+        activeProjectiles[projId] = nil
+        activeTracerPool = math.max(0, activeTracerPool - 1)
+        if p.model then p.model:Destroy() end
+    end
+end)
+table.insert(connections, impactConn)
+
+-- 6. SURVIVOR ESP
+local function updatePlayerESP(player, g1Id, g2Id)
+    if player == LocalPlayer then return end
+    if player.UserId == g1Id or player.UserId == g2Id then
+        if espRegistry[player] then
+            if espRegistry[player].highlight then espRegistry[player].highlight.Enabled = false end
+            if espRegistry[player].billboard then espRegistry[player].billboard.Enabled = false end
+        end
+        return
+    end
+
+    local char = player.Character
+    if not char then
+        if espRegistry[player] then
+            if espRegistry[player].highlight then espRegistry[player].highlight:Destroy() end
+            if espRegistry[player].billboard then espRegistry[player].billboard:Destroy() end
+            espRegistry[player] = nil
+        end
+        return
+    end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then
+        if espRegistry[player] then
+            if espRegistry[player].highlight then espRegistry[player].highlight.Enabled = false end
+            if espRegistry[player].billboard then espRegistry[player].billboard.Enabled = false end
+        end
+        return
+    end
+
+    local entry = espRegistry[player]
+    if not entry then
+        local hl = Instance.new("Highlight")
+        hl.Name = "ESP_Highlight"
+        hl.Adornee = char
+        hl.FillColor = Color3.fromRGB(0, 180, 255)
+        hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+        hl.FillTransparency = 0.65
+        hl.OutlineTransparency = 0.2
+        hl.Enabled = settings.showESP
+        hl.Parent = visualFolder
+
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "ESP_Billboard"
+        bb.Adornee = hrp
+        bb.Size = UDim2.new(0, 140, 0, 32)
+        bb.StudsOffset = Vector3.new(0, 3, 0)
+        bb.AlwaysOnTop = true
+        bb.Enabled = settings.showESP
+        bb.Parent = visualFolder
+
+        local text = Instance.new("TextLabel")
+        text.Size = UDim2.new(1, 0, 1, 0)
+        text.BackgroundTransparency = 1
+        text.Font = Enum.Font.GothamBold
+        text.TextSize = 11
+        text.TextColor3 = Color3.fromRGB(255, 255, 255)
+        text.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+        text.TextStrokeTransparency = 0.3
+        text.Parent = bb
+
+        entry = { highlight = hl, billboard = bb, label = text }
+        espRegistry[player] = entry
+    end
+
+    if char.Parent and entry.highlight.Adornee ~= char then
+        entry.highlight.Adornee = char
+        entry.billboard.Adornee = hrp
+    end
+
+    local myHrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local dist = myHrp and (hrp.Position - myHrp.Position).Magnitude or 0
+
+    local hpPct = math.clamp(hum.Health / (hum.MaxHealth > 0 and hum.MaxHealth or 100), 0, 1)
+    local col = hpPct > 0.5 and Color3.fromRGB(80, 220, 120) or (hpPct > 0.25 and Color3.fromRGB(255, 180, 40) or Color3.fromRGB(255, 60, 60))
+
+    entry.label.Text = string.format("%s (%d HP) | %.0fm", player.DisplayName, math.floor(hum.Health), dist)
+    entry.label.TextColor3 = col
+    entry.highlight.FillColor = col
+    entry.highlight.Enabled = settings.showESP
+    entry.billboard.Enabled = settings.showESP
+end
+
+-- 7. DUAL COVER & NAVIGATION GUIDANCE
+local lastCoverScan = 0
+local nearestSafePos = nil
+local nearestSafeDist = 9999
+local coverFromG1 = false
+local coverFromG2 = false
+
+local function getCardinalDirection(fromPos, toPos)
+    local diff = toPos - fromPos
+    local angle = math.atan2(diff.X, diff.Z)
+    local deg = math.deg(angle)
+    if deg < 0 then deg = deg + 360 end
+
+    if deg >= 337.5 or deg < 22.5 then return "SOUTH"
+    elseif deg >= 22.5 and deg < 67.5 then return "SOUTH-EAST"
+    elseif deg >= 67.5 and deg < 112.5 then return "EAST"
+    elseif deg >= 112.5 and deg < 157.5 then return "NORTH-EAST"
+    elseif deg >= 157.5 and deg < 202.5 then return "NORTH"
+    elseif deg >= 202.5 and deg < 247.5 then return "NORTH-WEST"
+    elseif deg >= 247.5 and deg < 292.5 then return "WEST"
+    else return "SOUTH-WEST" end
+end
+
+local function scanDualCover(myPos, plane1Pos, plane2Pos, isG2Active)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character, visualFolder }
+
+    local hit1 = workspace:Raycast(myPos, plane1Pos - myPos, params)
+    coverFromG1 = (hit1 ~= nil)
+
+    if isG2Active then
+        local hit2 = workspace:Raycast(myPos, plane2Pos - myPos, params)
+        coverFromG2 = (hit2 ~= nil)
+    else
+        coverFromG2 = true
+    end
+
+    local fullyCovered = coverFromG1 and coverFromG2
+    nearestSafeDist = 9999
+    nearestSafePos = nil
+
+    if fullyCovered then
+        nearestSafePos = myPos
+        nearestSafeDist = 0
+        return
+    end
+
+    for angle = 0, 315, 45 do
+        local rad = math.rad(angle)
+        for r = 8, 32, 8 do
+            local testPos = myPos + Vector3.new(math.cos(rad) * r, 0, math.sin(rad) * r)
+            local safe1 = workspace:Raycast(testPos, plane1Pos - testPos, params) ~= nil
+            local safe2 = (not isG2Active) or (workspace:Raycast(testPos, plane2Pos - testPos, params) ~= nil)
+
+            if safe1 and safe2 then
+                local d = (testPos - myPos).Magnitude
+                if d < nearestSafeDist then
+                    nearestSafeDist = d
+                    nearestSafePos = testPos
+                end
+                break
+            end
+        end
+    end
+end
+
+local function getGunnerName(userId, fallback)
+    if not userId or userId == 0 then return fallback end
+    local p = Players:GetPlayerByUserId(userId)
+    if p then return p.DisplayName end
+    return fallback
+end
+
+-- 8. AUTO-DODGE & AUTO-EXTRACT EXECUTION
+local lastDodgeTime = 0
+
+local function performAutoDodge(myPos, hum)
+    if not settings.autoDodge or not hum or hum.Health <= 0 then return false end
+
+    -- Check all incoming projectiles
+    local imminentImpact = nil
+    local minDangerDist = 999
+
+    for _, p in pairs(activeProjectiles) do
+        if p.impactPos then
+            local dist = (Vector3.new(p.impactPos.X, myPos.Y, p.impactPos.Z) - myPos).Magnitude
+            local dangerRadius = (p.radius or 12) + 6
+            if dist < dangerRadius and dist < minDangerDist then
+                imminentImpact = p
+                minDangerDist = dist
+            end
+        end
+    end
+
+    -- If shell is landing directly on us, dodge away!
+    if imminentImpact then
+        local blastPos = imminentImpact.impactPos
+        local awayDir = Vector3.new(myPos.X - blastPos.X, 0, myPos.Z - blastPos.Z)
+        if awayDir.Magnitude < 0.1 then
+            awayDir = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5)
+        end
+        awayDir = awayDir.Unit
+
+        local dodgeTarget = blastPos + awayDir * ((imminentImpact.radius or 12) + 14)
+        hum:MoveTo(dodgeTarget)
+        lastDodgeTime = os.clock()
+        return true
+    end
+
+    return false
+end
+
+local function performAutoExtract(myPos, hum, char)
+    if not settings.autoExtract or not hum or hum.Health <= 0 then return end
+    if char:GetAttribute("Extracted") == true then
+        extractStatusLabel.Text = "EXTRACTION: EXTRACTED ✅"
+        extractStatusLabel.TextColor3 = Color3.fromRGB(80, 255, 140)
+        extractReticle.Transparency = 1
+        extractBox.Visible = false
+        return
+    end
+
+    local lz = GameState:GetAttribute("ExtractionLZ")
+    local extFolder = workspace:FindFirstChild("Extraction")
+    local heli = extFolder and extFolder:FindFirstChild("ExtractionHeli")
+    local targetPos = lz or (heli and heli.PrimaryPart and heli.PrimaryPart.Position)
+
+    if targetPos then
+        local distToLZ = (Vector3.new(targetPos.X, myPos.Y, targetPos.Z) - myPos).Magnitude
+        extractReticle.CFrame = CFrame.new(targetPos) * CFrame.Angles(0, 0, math.rad(90))
+        extractReticle.Transparency = 0.25
+        extractBox.Visible = true
+
+        extractStatusLabel.Text = string.format("EXTRACTION: LZ ACTIVE (%.0f studs)", distToLZ)
+        extractStatusLabel.TextColor3 = Color3.fromRGB(0, 255, 200)
+
+        -- Don't override if currently dodging an imminent shell
+        if os.clock() - lastDodgeTime > 0.4 then
+            if distToLZ > 5 then
+                hum:MoveTo(targetPos)
+            end
+        end
+    else
+        extractReticle.Transparency = 1
+        extractBox.Visible = false
+        extractStatusLabel.Text = "EXTRACTION: AWAITING LZ"
+        extractStatusLabel.TextColor3 = Color3.fromRGB(150, 160, 175)
+    end
+end
+
+-- 9. MAIN RENDER LOOP
+local renderConn = RunService.RenderStepped:Connect(function()
+    local phase = GameState:GetAttribute("Phase") or "Lobby"
+    local aim1 = GameState:GetAttribute("GunnerAim")
+    local aim2 = GameState:GetAttribute("Gunner2Aim")
+
+    local g1Id = GameState:GetAttribute("GunnerId") or 0
+    local g2Id = GameState:GetAttribute("Gunner2Id") or 0
+    local isG2Active = (g2Id ~= 0 and aim2 ~= nil)
+
+    local g1WpnIdx = GameState:GetAttribute("GunnerWeapon") or 1
+    local g2WpnIdx = GameState:GetAttribute("Gunner2Weapon") or 1
+
+    local g1Thermal = GameState:GetAttribute("GunnerThermal") == true
+    local g2Thermal = GameState:GetAttribute("Gunner2Thermal") == true
+
+    local ship1 = workspace:FindFirstChild("GunshipVisual")
+    local ship2 = workspace:FindFirstChild("GunshipVisual2")
+
+    local plane1Pos = (ship1 and ship1.PrimaryPart and ship1.PrimaryPart.Position) or (aim1 and (aim1 + Vector3.new(0, 1400, 0))) or Vector3.new(0, 1400, 0)
+    local plane2Pos = (ship2 and ship2.PrimaryPart and ship2.PrimaryPart.Position) or (aim2 and (aim2 + Vector3.new(0, 1400, 0))) or Vector3.new(0, 1400, 0)
+
+    -- Animate Projectile Beads
+    local serverNow = workspace:GetServerTimeNow()
+    for id, p in pairs(activeProjectiles) do
+        if p.bulletBead and p.bulletBead.Parent then
+            local elapsed = serverNow - p.t0
+            if elapsed >= 0 then
+                local gravity = Vector3.new(0, -35, 0)
+                local curPos = p.origin + p.vel * elapsed + 0.5 * gravity * elapsed * elapsed
+                local curVel = p.vel + gravity * elapsed
+                p.bulletBead.CFrame = CFrame.lookAt(curPos, curPos + curVel)
+
+                if curPos.Y <= p.impactPos.Y or (curPos - p.impactPos).Magnitude < 12 then
+                    p.bulletBead.Transparency = 1
+                end
+            end
+        end
+    end
+
+    if phase ~= "Hunt" or not aim1 then
+        reticle1.bead.Transparency = 1
+        reticle1.outerRing.Transparency = 1
+        reticle1.box.Visible = false
+        reticle1.beam.Enabled = false
+
+        reticle2.bead.Transparency = 1
+        reticle2.outerRing.Transparency = 1
+        reticle2.box.Visible = false
+        reticle2.beam.Enabled = false
+
+        coverPillar.Transparency = 1
+        coverBox.Visible = false
+        extractReticle.Transparency = 1
+        extractBox.Visible = false
+
+        modeBadge.Text = "LOBBY"
+        modeBadge.TextColor3 = Color3.fromRGB(150, 150, 150)
+        gCard1.titleLbl.Text = "GUNNER #1: STANDBY"
+        gCard1.wpnLbl.Text = "Intermission"
+        gCard1.distBar.Text = "Standby"
+        gCard2.titleLbl.Text = "GUNNER #2: INACTIVE"
+        gCard2.wpnLbl.Text = "Inactive"
+        gCard2.distBar.Text = "Inactive"
+
+        coverStatusLabel.Text = "COVER: LOBBY SAFE"
+        coverStatusLabel.TextColor3 = Color3.fromRGB(80, 220, 120)
+        navGuideLabel.Text = "No active gunship threats."
+        extractStatusLabel.Text = "EXTRACTION: INACTIVE"
+        return
+    end
+
+    modeBadge.Text = isG2Active and "DOUBLE TROUBLE" or "SOLO AC-130"
+    modeBadge.TextColor3 = isG2Active and Color3.fromRGB(255, 180, 50) or Color3.fromRGB(100, 200, 255)
+
+    -- RETICLE 1
+    local wpn1 = WEAPONS[g1WpnIdx] or { name = "25mm", radius = 5, color = Color3.fromRGB(255, 65, 65) }
+    reticle1.bead.CFrame = CFrame.new(aim1)
+    reticle1.outerRing.Size = Vector3.new(0.35, wpn1.radius * 2, wpn1.radius * 2)
+    reticle1.outerRing.CFrame = CFrame.new(aim1) * CFrame.Angles(0, 0, math.rad(90))
+    reticle1.attPlane.WorldPosition = plane1Pos
+    reticle1.beam.Color = ColorSequence.new(wpn1.color)
+    reticle1.beam.Enabled = settings.showTracerBeams
+
+    if settings.showAimRings then
+        reticle1.bead.Transparency = 0.2
+        reticle1.outerRing.Transparency = 0.35
+        reticle1.box.Visible = true
+    end
+
+    -- RETICLE 2
+    local wpn2 = WEAPONS[g2WpnIdx] or { name = "40mm", radius = 13, color = Color3.fromRGB(255, 165, 45) }
+    if isG2Active then
+        reticle2.bead.CFrame = CFrame.new(aim2)
+        reticle2.outerRing.Size = Vector3.new(0.35, wpn2.radius * 2, wpn2.radius * 2)
+        reticle2.outerRing.CFrame = CFrame.new(aim2) * CFrame.Angles(0, 0, math.rad(90))
+        reticle2.attPlane.WorldPosition = plane2Pos
+        reticle2.beam.Color = ColorSequence.new(wpn2.color)
+        reticle2.beam.Enabled = settings.showTracerBeams
+
+        if settings.showAimRings then
+            reticle2.bead.Transparency = 0.2
+            reticle2.outerRing.Transparency = 0.35
+            reticle2.box.Visible = true
+        end
+    else
+        reticle2.bead.Transparency = 1
+        reticle2.outerRing.Transparency = 1
+        reticle2.box.Visible = false
+        reticle2.beam.Enabled = false
+    end
+
+    -- FLIR Badges
+    gCard1.thermalBadge.Text = g1Thermal and "FLIR: ACTIVE 👁️" or "FLIR: OFF"
+    gCard1.thermalBadge.BackgroundColor3 = g1Thermal and Color3.fromRGB(60, 20, 20) or Color3.fromRGB(25, 30, 40)
+    gCard1.thermalBadge.TextColor3 = g1Thermal and Color3.fromRGB(255, 80, 80) or Color3.fromRGB(140, 150, 165)
+
+    if isG2Active then
+        gCard2.thermalBadge.Text = g2Thermal and "FLIR: ACTIVE 👁️" or "FLIR: OFF"
+        gCard2.thermalBadge.BackgroundColor3 = g2Thermal and Color3.fromRGB(60, 20, 20) or Color3.fromRGB(25, 30, 40)
+        gCard2.thermalBadge.TextColor3 = g2Thermal and Color3.fromRGB(255, 80, 80) or Color3.fromRGB(140, 150, 165)
+    else
+        gCard2.thermalBadge.Text = "INACTIVE"
+        gCard2.thermalBadge.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+        gCard2.thermalBadge.TextColor3 = Color3.fromRGB(100, 105, 115)
+    end
+
+    -- TELEMETRY & MOVEMENT
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    if hrp and hum then
+        local myPos = hrp.Position
+        local dist1 = (Vector3.new(aim1.X, myPos.Y, aim1.Z) - myPos).Magnitude
+        local dist2 = isG2Active and (Vector3.new(aim2.X, myPos.Y, aim2.Z) - myPos).Magnitude or 9999
+
+        gCard1.titleLbl.Text = "GUNNER #1: " .. getGunnerName(g1Id, "Alpha")
+        gCard1.wpnLbl.Text = string.format("Weapon: %s (Radius: %d studs)", wpn1.name, wpn1.radius)
+        gCard1.distBar.Text = string.format("Crosshair Distance: %.1f studs", dist1)
+        gCard1.distBar.TextColor3 = (dist1 <= wpn1.radius) and Color3.fromRGB(255, 60, 60) or ((dist1 <= wpn1.radius + 35) and Color3.fromRGB(255, 180, 50) or Color3.fromRGB(100, 220, 140))
+
+        if isG2Active then
+            gCard2.titleLbl.Text = "GUNNER #2: " .. getGunnerName(g2Id, "Bravo")
+            gCard2.wpnLbl.Text = string.format("Weapon: %s (Radius: %d studs)", wpn2.name, wpn2.radius)
+            gCard2.distBar.Text = string.format("Crosshair Distance: %.1f studs", dist2)
+            gCard2.distBar.TextColor3 = (dist2 <= wpn2.radius) and Color3.fromRGB(255, 60, 60) or ((dist2 <= wpn2.radius + 35) and Color3.fromRGB(255, 180, 50) or Color3.fromRGB(100, 220, 140))
+        else
+            gCard2.titleLbl.Text = "GUNNER #2: INACTIVE"
+            gCard2.wpnLbl.Text = "Only 1 gunship deployed."
+            gCard2.distBar.Text = "Standby"
+            gCard2.distBar.TextColor3 = Color3.fromRGB(120, 125, 135)
+        end
+
+        -- Dual Cover Scan
+        local now = os.clock()
+        if now - lastCoverScan > 0.15 then
+            lastCoverScan = now
+            scanDualCover(myPos, plane1Pos, plane2Pos, isG2Active)
+        end
+
+        -- Cover Status
+        if coverFromG1 and coverFromG2 then
+            coverStatusLabel.Text = "COVER: 100% PROTECTED (BLINDSPOT)"
+            coverStatusLabel.TextColor3 = Color3.fromRGB(70, 255, 130)
+            navGuideLabel.Text = "Position safe from all overhead line of sight."
+            coverPillar.Transparency = 1
+            coverBox.Visible = false
+        else
+            if not coverFromG1 and coverFromG2 then
+                coverStatusLabel.Text = "COVER: EXPOSED TO GUNNER #1"
+                coverStatusLabel.TextColor3 = Color3.fromRGB(255, 160, 50)
+            elseif coverFromG1 and not coverFromG2 then
+                coverStatusLabel.Text = "COVER: EXPOSED TO GUNNER #2"
+                coverStatusLabel.TextColor3 = Color3.fromRGB(255, 160, 50)
+            else
+                coverStatusLabel.Text = "COVER: FULLY EXPOSED TO SKY!"
+                coverStatusLabel.TextColor3 = Color3.fromRGB(255, 60, 60)
+            end
+
+            if nearestSafePos and settings.showCoverWaypoint then
+                local compassDir = getCardinalDirection(myPos, nearestSafePos)
+                navGuideLabel.Text = string.format("Run %s towards safe blindspot (%.0f studs)", compassDir, nearestSafeDist)
+                coverPillar.CFrame = CFrame.new(nearestSafePos) * CFrame.Angles(0, 0, math.rad(90))
+                coverPillar.Transparency = 0.3
+                coverBox.Visible = true
+            else
+                navGuideLabel.Text = "No full blindspot nearby. Stay low!"
+                coverPillar.Transparency = 1
+                coverBox.Visible = false
+            end
+        end
+
+        -- AUTO-DODGE & AUTO-EXTRACT
+        local isDodging = performAutoDodge(myPos, hum)
+        if not isDodging then
+            -- Crosshair proximity dodge check (if gunner is aiming right on your head)
+            local gunnerAimDanger = (dist1 < wpn1.radius + 4) or (isG2Active and dist2 < wpn2.radius + 4)
+            if settings.autoDodge and gunnerAimDanger then
+                local dangerAim = (dist1 < wpn1.radius + 4) and aim1 or aim2
+                local awayDir = Vector3.new(myPos.X - dangerAim.X, 0, myPos.Z - dangerAim.Z)
+                if awayDir.Magnitude < 0.1 then awayDir = Vector3.new(1, 0, 0) end
+                hum:MoveTo(dangerAim + awayDir.Unit * (wpn1.radius + 14))
+                isDodging = true
+            end
+        end
+
+        if not isDodging then
+            performAutoExtract(myPos, hum, char)
+        end
+    end
+
+    if settings.showESP then
+        for _, p in ipairs(Players:GetPlayers()) do
+            updatePlayerESP(p, g1Id, g2Id)
+        end
+    end
+end)
+
+table.insert(connections, renderConn)
+print("[AC-130 Tactical] 4.0 Loaded: Auto-Dodge & Auto-Extract active!")
